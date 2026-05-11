@@ -280,11 +280,15 @@ func (c *Client) DeleteAsset(assetID, datasetID string) error {
 }
 
 func (c *Client) setAuthHeader(req *http.Request) {
+	// Processor mode: SESSION_TOKEN is a Cognito Bearer that works against
+	// both API hosts. Use it unconditionally when present.
+	if c.auth.SessionToken != "" {
+		req.Header.Set("Authorization", "Bearer "+c.auth.SessionToken)
+		return
+	}
+	// Target mode: legacy host requires a Bearer (Callback is api2-only).
+	// Mint one via Cognito if API key + secret + app id are configured.
 	if legacyURL, err := url.Parse(c.apiHost); err == nil && req.URL.Host == legacyURL.Host {
-		if c.auth.SessionToken != "" {
-			req.Header.Set("Authorization", "Bearer "+c.auth.SessionToken)
-			return
-		}
 		if c.auth.APIKey != "" && c.auth.APISecret != "" && c.auth.CognitoAppID != "" {
 			if tok, err := c.getBearer(); err == nil {
 				req.Header.Set("Authorization", "Bearer "+tok)

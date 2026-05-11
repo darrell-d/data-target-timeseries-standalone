@@ -44,15 +44,16 @@ func Load() (*Config, error) {
 	if cfg.InputDir == "" {
 		return nil, fmt.Errorf("INPUT_DIR is required")
 	}
-	if cfg.CallbackToken == "" {
-		return nil, fmt.Errorf("CALLBACK_TOKEN is required")
-	}
-	if cfg.DatasetID == "" {
-		return nil, fmt.Errorf("DATASET_ID is required")
-	}
 	if cfg.ExecutionRunID == "" {
 		return nil, fmt.Errorf("EXECUTION_RUN_ID is required")
 	}
+	// CALLBACK_TOKEN is target-only — processors authenticate via
+	// SESSION_TOKEN (Bearer) on both API hosts. Require one of the two.
+	if cfg.CallbackToken == "" && cfg.SessionToken == "" {
+		return nil, fmt.Errorf("either CALLBACK_TOKEN (target mode) or SESSION_TOKEN (processor mode) is required")
+	}
+	// DATASET_ID is target-injected too; for processor mode it's
+	// derived from the execution-run lookup in the handler.
 	if cfg.APIHost == "" {
 		return nil, fmt.Errorf("PENNSIEVE_API_HOST is required")
 	}

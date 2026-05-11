@@ -69,6 +69,13 @@ func Run(ctx context.Context, cfg *config.Config, client *pennsieve.Client) (str
 	if err != nil {
 		return "", fmt.Errorf("fetching execution run: %w", err)
 	}
+	// Processor mode doesn't get DATASET_ID injected; derive it from the run.
+	if cfg.DatasetID == "" {
+		cfg.DatasetID = execRun.DatasetID
+	}
+	if cfg.DatasetID == "" {
+		return "", fmt.Errorf("DATASET_ID not set and execution run has no datasetId")
+	}
 	packageIDs, err := pennsieve.GetPackageIDs(execRun)
 	if err != nil {
 		return "", err
