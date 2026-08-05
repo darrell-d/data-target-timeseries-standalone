@@ -40,6 +40,7 @@ func run() error {
 	}
 	auth := pennsieve.AuthConfig{
 		SessionToken:  cfg.SessionToken,
+		RefreshToken:  cfg.RefreshToken,
 		APIKey:        cfg.PennsieveAPIKey,
 		APISecret:     cfg.PennsieveSecret,
 		CognitoRegion: cfg.CognitoRegion,

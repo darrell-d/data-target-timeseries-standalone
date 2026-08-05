@@ -17,8 +17,9 @@ type Config struct {
 	DatasetID      string
 	OrganizationID string
 
-	// Legacy-host auth. See pennsieve.AuthConfig for resolution order.
+	// API auth. See pennsieve.AuthConfig for resolution order.
 	SessionToken    string
+	RefreshToken    string
 	PennsieveAPIKey string
 	PennsieveSecret string
 	CognitoRegion   string
@@ -35,6 +36,7 @@ func Load() (*Config, error) {
 		DatasetID:       os.Getenv("DATASET_ID"),
 		OrganizationID:  os.Getenv("ORGANIZATION_ID"),
 		SessionToken:    os.Getenv("SESSION_TOKEN"),
+		RefreshToken:    os.Getenv("REFRESH_TOKEN"),
 		PennsieveAPIKey: os.Getenv("PENNSIEVE_API_KEY"),
 		PennsieveSecret: os.Getenv("PENNSIEVE_API_SECRET"),
 		CognitoRegion:   os.Getenv("PENNSIEVE_COGNITO_REGION"),
