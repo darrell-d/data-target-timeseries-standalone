@@ -2,44 +2,63 @@ package pennsieve
 
 import (
 	"bytes"
+	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/url"
+	"strings"
 	"sync"
 	"time"
 )
 
 const bearerRefreshSkew = 5 * time.Minute
 
-// AuthConfig configures how Client authenticates against the legacy
-// Pennsieve API host. The api2 host always uses the workflow callback
-// scheme (executionRunID + callbackToken) and is unaffected by this.
+// cognitoEndpointOverride points InitiateAuth at a stub server. Set by tests
+// only; empty in every real run.
+var cognitoEndpointOverride string
+
+// AuthConfig configures how Client obtains a Bearer token.
 //
-// Resolution order in setAuthHeader for the legacy host:
-//   1. SessionToken set → used directly as the Bearer (no mint, no cache).
-//      This is the path used when running as a processor node, where the
-//      orchestrator natively injects SESSION_TOKEN.
-//   2. APIKey + APISecret + CognitoAppID set → minted via Cognito
-//      USER_PASSWORD_AUTH and cached until near expiry.
-//   3. Otherwise → falls back to the Callback scheme (legacy host will
-//      most likely reject it, but the resulting 401 surfaces cleanly).
+// Resolution order in getBearer:
+//  1. SessionToken, while it still has more than bearerRefreshSkew left.
+//     This is what the orchestrator injects for a processor node.
+//  2. RefreshToken exchanged via Cognito REFRESH_TOKEN_AUTH. Refresh tokens
+//     are long-lived (30d by default), so this works even when SessionToken
+//     expired hours ago.
+//  3. APIKey + APISecret + CognitoAppID minted via Cognito
+//     USER_PASSWORD_AUTH.
+//
+// Every result is cached until near expiry and re-derived on demand, so a
+// stage that runs for hours keeps signing requests with a live token.
+//
+// Why this matters: SESSION_TOKEN is minted once when the workflow run
+// starts and stored in Secrets Manager; every stage reads that same value
+// and nothing refreshes it. A Cognito access token lives ~60 minutes. Any
+// chain longer than that hands its later stages a dead token, and the
+// api2 authorizer rejects it with a bare 403 Forbidden.
 type AuthConfig struct {
 	SessionToken  string
+	RefreshToken  string
 	APIKey        string
 	APISecret     string
 	CognitoRegion string
 	CognitoAppID  string
 }
 
-// bearerCache holds a minted Cognito access token and its expiry.
-// Refreshed lazily by Client.getBearer when within bearerRefreshSkew of
-// expiry. Unused when AuthConfig.SessionToken is set.
+// bearerCache holds the current Cognito access token and its expiry.
+// Re-derived lazily by Client.getBearer when within bearerRefreshSkew of
+// expiry. seeded records whether the injected SessionToken has been
+// considered yet, so an already-expired one is tried once and then skipped
+// in favour of the refresh path.
 type bearerCache struct {
 	mu     sync.Mutex
 	token  string
 	expiry time.Time
+	seeded bool
 }
 
 // Client is a minimal HTTP client for the Pennsieve API endpoints needed
@@ -280,32 +299,37 @@ func (c *Client) DeleteAsset(assetID, datasetID string) error {
 }
 
 func (c *Client) setAuthHeader(req *http.Request) {
-	// Processor mode: SESSION_TOKEN is a Cognito Bearer that works against
-	// both API hosts. Use it unconditionally when present.
-	if c.auth.SessionToken != "" {
-		req.Header.Set("Authorization", "Bearer "+c.auth.SessionToken)
-		return
-	}
-	// Target mode: legacy host requires a Bearer (Callback is api2-only).
-	// Mint one via Cognito if API key + secret + app id are configured.
-	if legacyURL, err := url.Parse(c.apiHost); err == nil && req.URL.Host == legacyURL.Host {
-		if c.auth.APIKey != "" && c.auth.APISecret != "" && c.auth.CognitoAppID != "" {
-			if tok, err := c.getBearer(); err == nil {
-				req.Header.Set("Authorization", "Bearer "+tok)
-				return
-			}
-			// Fall through to Callback on mint failure; the request will
-			// likely 401 on the legacy host but the error surfaces cleanly.
+	// A Cognito Bearer works against both API hosts. Processor mode always
+	// has one available (SESSION_TOKEN, refreshed as needed); target mode
+	// only when API key credentials are configured.
+	if c.canBearer() {
+		if tok, err := c.getBearer(); err == nil {
+			req.Header.Set("Authorization", "Bearer "+tok)
+			return
+		} else if c.callbackToken == "" {
+			// No Callback fallback available, so the request is about to fail
+			// with an opaque 403 from the authorizer. Log the real reason.
+			slog.Error("no usable bearer token; request will be rejected", "error", err)
+		} else {
+			slog.Warn("bearer unavailable, falling back to callback auth", "error", err)
 		}
 	}
 	req.Header.Set("Authorization",
 		fmt.Sprintf("Callback workflow-service:%s:%s", c.executionRunID, c.callbackToken))
 }
 
-// getBearer returns a cached Cognito access token, minting a fresh one
-// when the cached value is missing or within bearerRefreshSkew of
-// expiry. Safe for concurrent use. Only called when AuthConfig.APIKey
-// is set (the mint path); the SessionToken path skips this entirely.
+// canBearer reports whether any bearer source is configured. Target mode
+// with only a callback token has none.
+func (c *Client) canBearer() bool {
+	if c.auth.SessionToken != "" || c.auth.RefreshToken != "" {
+		return true
+	}
+	return c.auth.APIKey != "" && c.auth.APISecret != "" && c.auth.CognitoAppID != ""
+}
+
+// getBearer returns a live Cognito access token, deriving a fresh one when
+// the cached value is missing or within bearerRefreshSkew of expiry.
+// Safe for concurrent use. See AuthConfig for the source precedence.
 func (c *Client) getBearer() (string, error) {
 	c.bearer.mu.Lock()
 	defer c.bearer.mu.Unlock()
@@ -314,29 +338,197 @@ func (c *Client) getBearer() (string, error) {
 		return c.bearer.token, nil
 	}
 
-	tok, expiresIn, err := mintCognitoAccessToken(c.httpClient, c.auth.CognitoRegion, c.auth.CognitoAppID, c.auth.APIKey, c.auth.APISecret)
-	if err != nil {
-		return "", fmt.Errorf("minting Cognito access token: %w", err)
+	// The injected session token, considered once. Expect it to be expired on
+	// any long chain — this stage runs last.
+	if !c.bearer.seeded {
+		c.bearer.seeded = true
+		if c.auth.SessionToken != "" {
+			exp, ok := jwtExpiry(c.auth.SessionToken)
+			switch {
+			case ok && time.Now().Before(exp.Add(-bearerRefreshSkew)):
+				c.bearer.token = c.auth.SessionToken
+				c.bearer.expiry = exp
+				return c.bearer.token, nil
+			case !ok && c.auth.RefreshToken == "":
+				// Can't read an expiry and have no way to get a new token;
+				// use it as-is rather than failing outright.
+				slog.Warn("session token has no readable exp claim; using as-is")
+				return c.auth.SessionToken, nil
+			case ok:
+				slog.Info("session token expired or expiring; refreshing", "expiredAt", exp.UTC().Format(time.RFC3339))
+			}
+		}
 	}
-	c.bearer.token = tok
-	c.bearer.expiry = time.Now().Add(time.Duration(expiresIn) * time.Second)
-	return tok, nil
+
+	var errs []error
+
+	if c.auth.RefreshToken != "" {
+		clientID, err := c.cognitoClientID()
+		if err != nil {
+			errs = append(errs, fmt.Errorf("resolving Cognito app client id: %w", err))
+		} else {
+			tok, expiresIn, err := refreshCognitoAccessToken(c.httpClient, c.auth.CognitoRegion, clientID, c.auth.RefreshToken)
+			if err != nil {
+				errs = append(errs, fmt.Errorf("refreshing Cognito access token: %w", err))
+			} else {
+				c.bearer.token = tok
+				c.bearer.expiry = time.Now().Add(time.Duration(expiresIn) * time.Second)
+				slog.Info("refreshed session token", "expiresIn", expiresIn)
+				return tok, nil
+			}
+		}
+	}
+
+	if c.auth.APIKey != "" && c.auth.APISecret != "" && c.auth.CognitoAppID != "" {
+		tok, expiresIn, err := mintCognitoAccessToken(c.httpClient, c.auth.CognitoRegion, c.auth.CognitoAppID, c.auth.APIKey, c.auth.APISecret)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("minting Cognito access token: %w", err))
+		} else {
+			c.bearer.token = tok
+			c.bearer.expiry = time.Now().Add(time.Duration(expiresIn) * time.Second)
+			return tok, nil
+		}
+	}
+
+	if len(errs) == 0 {
+		return "", fmt.Errorf("no bearer source available: session token expired and neither REFRESH_TOKEN nor PENNSIEVE_API_KEY is set")
+	}
+	return "", errors.Join(errs...)
+}
+
+// cognitoClientID resolves the app client id needed for a Cognito
+// InitiateAuth call, in order: configured value, the client_id claim on the
+// session token we were handed, then the unauthenticated cognito-config
+// endpoint on the legacy API host.
+func (c *Client) cognitoClientID() (string, error) {
+	if c.auth.CognitoAppID != "" {
+		return c.auth.CognitoAppID, nil
+	}
+	// A Cognito access token carries the client that issued it, so a
+	// processor can refresh without being told the id. Works on an expired
+	// token: we decode the claims, we don't validate them.
+	if id := jwtClaimString(c.auth.SessionToken, "client_id"); id != "" {
+		c.auth.CognitoAppID = id
+		return id, nil
+	}
+	region, id, err := fetchCognitoConfig(c.httpClient, c.apiHost)
+	if err != nil {
+		return "", err
+	}
+	c.auth.CognitoAppID = id
+	if region != "" {
+		c.auth.CognitoRegion = region
+	}
+	return id, nil
+}
+
+// fetchCognitoConfig reads the unauthenticated GET /authentication/cognito-config
+// endpoint on the legacy API host, returning (region, appClientId).
+func fetchCognitoConfig(httpClient *http.Client, apiHost string) (string, string, error) {
+	resp, err := httpClient.Get(apiHost + "/authentication/cognito-config")
+	if err != nil {
+		return "", "", fmt.Errorf("fetching cognito config: %w", err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", "", fmt.Errorf("reading cognito config: %w", err)
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return "", "", fmt.Errorf("cognito config: HTTP %d: %s", resp.StatusCode, string(body))
+	}
+	var parsed struct {
+		Region   string `json:"region"`
+		UserPool struct {
+			AppClientID string `json:"appClientId"`
+		} `json:"userPool"`
+	}
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		return "", "", fmt.Errorf("decoding cognito config: %w", err)
+	}
+	if parsed.UserPool.AppClientID == "" {
+		return "", "", fmt.Errorf("cognito config has no userPool.appClientId")
+	}
+	return parsed.Region, parsed.UserPool.AppClientID, nil
+}
+
+// jwtClaims decodes a JWT's payload without verifying its signature. The
+// caller is not authenticating anything — it only needs claims (exp,
+// client_id) off a token the orchestrator handed us, which may be expired.
+func jwtClaims(token string) (map[string]any, error) {
+	parts := strings.Split(token, ".")
+	if len(parts) != 3 {
+		return nil, fmt.Errorf("not a JWT: %d segments", len(parts))
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return nil, fmt.Errorf("decoding JWT payload: %w", err)
+	}
+	var claims map[string]any
+	if err := json.Unmarshal(payload, &claims); err != nil {
+		return nil, fmt.Errorf("unmarshaling JWT claims: %w", err)
+	}
+	return claims, nil
+}
+
+// jwtExpiry returns the token's exp claim. ok is false if the token is
+// unparseable or carries no numeric exp.
+func jwtExpiry(token string) (time.Time, bool) {
+	claims, err := jwtClaims(token)
+	if err != nil {
+		return time.Time{}, false
+	}
+	exp, ok := claims["exp"].(float64)
+	if !ok {
+		return time.Time{}, false
+	}
+	return time.Unix(int64(exp), 0), true
+}
+
+// jwtClaimString returns a string claim, or "" if absent/not a string.
+func jwtClaimString(token, claim string) string {
+	claims, err := jwtClaims(token)
+	if err != nil {
+		return ""
+	}
+	s, _ := claims[claim].(string)
+	return s
+}
+
+// refreshCognitoAccessToken exchanges a refresh token for a fresh access
+// token via Cognito REFRESH_TOKEN_AUTH, returning (accessToken,
+// expiresInSeconds). Needs no valid access token and no AWS credentials.
+func refreshCognitoAccessToken(httpClient *http.Client, region, clientID, refreshToken string) (string, int, error) {
+	return initiateAuth(httpClient, region, map[string]any{
+		"AuthFlow": "REFRESH_TOKEN_AUTH",
+		"AuthParameters": map[string]string{
+			"REFRESH_TOKEN": refreshToken,
+		},
+		"ClientId": clientID,
+	})
 }
 
 // mintCognitoAccessToken performs Cognito's USER_PASSWORD_AUTH InitiateAuth
 // against the given app client and returns (accessToken, expiresInSeconds).
-// Cognito InitiateAuth is unauthenticated (requires no AWS creds), so we
-// post directly to the cognito-idp endpoint and avoid pulling in the
-// AWS SDK service module.
 func mintCognitoAccessToken(httpClient *http.Client, region, clientID, username, password string) (string, int, error) {
-	endpoint := fmt.Sprintf("https://cognito-idp.%s.amazonaws.com/", region)
-	body := map[string]any{
+	return initiateAuth(httpClient, region, map[string]any{
 		"AuthFlow": "USER_PASSWORD_AUTH",
 		"AuthParameters": map[string]string{
 			"USERNAME": username,
 			"PASSWORD": password,
 		},
 		"ClientId": clientID,
+	})
+}
+
+// initiateAuth posts a Cognito InitiateAuth body and returns (accessToken,
+// expiresInSeconds). InitiateAuth is unauthenticated (requires no AWS creds),
+// so we post directly to the cognito-idp endpoint and avoid pulling in the
+// AWS SDK service module.
+func initiateAuth(httpClient *http.Client, region string, body map[string]any) (string, int, error) {
+	endpoint := fmt.Sprintf("https://cognito-idp.%s.amazonaws.com/", region)
+	if cognitoEndpointOverride != "" {
+		endpoint = cognitoEndpointOverride
 	}
 	jsonBody, err := json.Marshal(body)
 	if err != nil {
