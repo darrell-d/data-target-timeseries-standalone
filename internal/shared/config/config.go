@@ -3,7 +3,23 @@ package config
 import (
 	"fmt"
 	"os"
+	"strconv"
 )
+
+// defaultUploadConcurrency is sized for the ~1 MiB chunk PUTs this
+// target emits: enough parallelism to hide per-request latency, well
+// under S3's 3,500 PUT/s per-prefix ceiling.
+const defaultUploadConcurrency = 32
+
+// intFromEnv reads a positive integer from the environment, falling
+// back to def when unset, unparseable, or non-positive.
+func intFromEnv(key string, def int) int {
+	v, err := strconv.Atoi(os.Getenv(key))
+	if err != nil || v <= 0 {
+		return def
+	}
+	return v
+}
 
 // Config holds the workflow-runtime fields common to every data target.
 // Target-specific config (asset name, properties file, etc.) lives in
@@ -16,6 +32,12 @@ type Config struct {
 	CallbackToken  string
 	DatasetID      string
 	OrganizationID string
+
+	// UploadConcurrency bounds the number of chunk uploads in flight.
+	// Chunk PUTs are latency-bound (~1 MiB each), so throughput scales
+	// with concurrency until the task's NIC saturates. Tunable via
+	// UPLOAD_CONCURRENCY without a redeploy.
+	UploadConcurrency int
 
 	// API auth. See pennsieve.AuthConfig for resolution order.
 	SessionToken    string
@@ -41,6 +63,8 @@ func Load() (*Config, error) {
 		PennsieveSecret: os.Getenv("PENNSIEVE_API_SECRET"),
 		CognitoRegion:   os.Getenv("PENNSIEVE_COGNITO_REGION"),
 		CognitoAppID:    os.Getenv("PENNSIEVE_COGNITO_APP_ID"),
+
+		UploadConcurrency: intFromEnv("UPLOAD_CONCURRENCY", defaultUploadConcurrency),
 	}
 
 	if cfg.InputDir == "" {
