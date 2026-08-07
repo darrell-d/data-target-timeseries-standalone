@@ -8,9 +8,10 @@
 //  2. Find or create a viewer_asset linked to all workflow packages.
 //     Idempotent: a 'ready' existing asset short-circuits the run.
 //  3. Create channels under the viewer_asset (FK on channels.viewer_asset_id).
-//  4. Rename chunk files to use channel node ids in their basenames so
-//     the streaming-side range lookup matches the legacy naming.
-//  5. Upload chunks to S3 using the asset's STS credentials.
+//  4. Map each chunk file to the S3 key the streaming-side range lookup
+//     expects, substituting the channel node id for the staged
+//     "channel-NNNNN" ordinal. The files themselves are not touched.
+//  5. Upload chunks to S3 concurrently using the asset's STS credentials.
 //  6. Register ranges via timeseries-service.
 //  7. Mark the asset 'ready'.
 //  8. On any failure: delete created channels, then delete the asset
@@ -171,19 +172,24 @@ func runIngest(
 		return fmt.Errorf("no channels were resolved from staged metadata files; refusing to mark asset ready with empty data")
 	}
 
-	// Rename chunk basenames from "channel-NNNNN_..." to
-	// "{channel.id}_..." so streaming-side range lookups match the
-	// keys we'll register and upload.
-	renamed, err := renameDataFilesToNodeIDs(dataFiles, channelsByIndex)
+	// Map chunk basenames from "channel-NNNNN_..." to "{channel.id}_..."
+	// so streaming-side range lookups match the keys we register and
+	// upload. This is a pure mapping — the files stay put under their
+	// staged names, and the new name is applied as the S3 key at upload
+	// time. Renaming them on EFS instead would cost one NFS round-trip
+	// per chunk, and would make the step non-idempotent: a re-run would
+	// find already-renamed files that no longer match the expected
+	// channel-NNNNN pattern and fail outright.
+	chunkUploads, err := mapChunkKeys(dataFiles, channelsByIndex)
 	if err != nil {
 		return err
 	}
-	if len(renamed) == 0 {
+	if len(chunkUploads) == 0 {
 		return fmt.Errorf("no chunk files were resolved from the output directory; refusing to mark asset ready with empty data")
 	}
 
 	// Upload to S3 using the STS creds returned by create_asset.
-	uploads, err := pennsieve.UploadChunks(ctx, uploadCreds, renamed, cfg.InputDir)
+	uploads, err := pennsieve.UploadChunks(ctx, uploadCreds, chunkUploads, cfg.UploadConcurrency)
 	if err != nil {
 		return fmt.Errorf("uploading chunks: %w", err)
 	}
@@ -374,14 +380,17 @@ func createOrResolveChannels(
 	return channels, createdNodeIDs, nil
 }
 
-// renameDataFilesToNodeIDs renames each chunk binary in place, swapping
-// the "channel-NNNNN" prefix for the channel's node id. Mirrors the
-// legacy importer's substitution so the resulting S3 keys match what
-// the streaming side expects to fetch via timeseries.ranges.location.
+// mapChunkKeys pairs each chunk binary with the S3 key it should take,
+// swapping the "channel-NNNNN" prefix for the channel's node id.
+// Mirrors the legacy importer's substitution so the resulting S3 keys
+// match what the streaming side expects to fetch via
+// timeseries.ranges.location.
 //
-// Returns the list of new paths (the original list is invalidated).
-func renameDataFilesToNodeIDs(dataFiles []string, channelsByIndex map[string]*pennsieve.TimeSeriesChannel) ([]string, error) {
-	renamed := make([]string, 0, len(dataFiles))
+// Files are left untouched on disk; the substitution is applied to the
+// key at upload time. This keeps the step idempotent and avoids one
+// EFS metadata round-trip per chunk.
+func mapChunkKeys(dataFiles []string, channelsByIndex map[string]*pennsieve.TimeSeriesChannel) ([]pennsieve.ChunkUpload, error) {
+	out := make([]pennsieve.ChunkUpload, 0, len(dataFiles))
 	for _, fp := range dataFiles {
 		base := filepath.Base(fp)
 		match := channelIndexPattern.FindStringSubmatch(base)
@@ -397,14 +406,12 @@ func renameDataFilesToNodeIDs(dataFiles []string, channelsByIndex map[string]*pe
 			)
 		}
 
-		newBase := channelIndexPattern.ReplaceAllString(base, ch.ID)
-		newPath := filepath.Join(filepath.Dir(fp), newBase)
-		if err := os.Rename(fp, newPath); err != nil {
-			return nil, fmt.Errorf("renaming %s -> %s: %w", fp, newPath, err)
-		}
-		renamed = append(renamed, newPath)
+		out = append(out, pennsieve.ChunkUpload{
+			LocalPath:   fp,
+			RelativeKey: channelIndexPattern.ReplaceAllString(base, ch.ID),
+		})
 	}
-	return renamed, nil
+	return out, nil
 }
 
 // buildRangeChunks converts each successful upload result into a
