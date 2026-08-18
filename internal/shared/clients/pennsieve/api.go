@@ -26,11 +26,12 @@ var cognitoEndpointOverride string
 // Resolution order in getBearer:
 //  1. SessionToken, while it still has more than bearerRefreshSkew left.
 //     This is what the orchestrator injects for a processor node.
-//  2. RefreshToken exchanged via Cognito REFRESH_TOKEN_AUTH. Refresh tokens
-//     are long-lived (30d by default), so this works even when SessionToken
-//     expired hours ago.
-//  3. APIKey + APISecret + CognitoAppID minted via Cognito
-//     USER_PASSWORD_AUTH.
+//  2. RefreshToken exchanged via Cognito REFRESH_TOKEN_AUTH.
+//  3. APIKey + APISecret minted via Cognito USER_PASSWORD_AUTH. CognitoAppID
+//     is optional — discovered from the cognito-config endpoint when unset.
+//
+// Resolution order is (3), (1), (2): key/secret is preferred whenever it is
+// configured, because it is the only source that survives a long run.
 //
 // Every result is cached until near expiry and re-derived on demand, so a
 // stage that runs for hours keeps signing requests with a live token.
@@ -40,6 +41,13 @@ var cognitoEndpointOverride string
 // and nothing refreshes it. A Cognito access token lives ~60 minutes. Any
 // chain longer than that hands its later stages a dead token, and the
 // api2 authorizer rejects it with a bare 403 Forbidden.
+//
+// The refresh token is not a way out either. Its lifetime is anchored to the
+// human login that produced it (auth_time), not to this run, and refreshing
+// yields a new access token but never a new refresh token — so the clock
+// never resets. A workflow launched from a day-old browser session can begin
+// with both tokens already dead. An API key/secret pair has no such clock,
+// which is why it is tried first.
 type AuthConfig struct {
 	SessionToken  string
 	RefreshToken  string
@@ -324,7 +332,13 @@ func (c *Client) canBearer() bool {
 	if c.auth.SessionToken != "" || c.auth.RefreshToken != "" {
 		return true
 	}
-	return c.auth.APIKey != "" && c.auth.APISecret != "" && c.auth.CognitoAppID != ""
+	// Deliberately does not require CognitoAppID: cognitoClientID discovers
+	// it from the unauthenticated cognito-config endpoint. Demanding it here
+	// would gate the key/secret path on the very value discovery provides,
+	// so a correctly configured key/secret would skip Cognito entirely and
+	// fall through to a Callback header with an empty token — surfacing as
+	// an opaque 401 from nginx rather than an auth error.
+	return c.auth.APIKey != "" && c.auth.APISecret != ""
 }
 
 // getBearer returns a live Cognito access token, deriving a fresh one when
@@ -336,6 +350,32 @@ func (c *Client) getBearer() (string, error) {
 
 	if c.bearer.token != "" && time.Now().Before(c.bearer.expiry.Add(-bearerRefreshSkew)) {
 		return c.bearer.token, nil
+	}
+
+	var errs []error
+
+	// Key/secret first when configured. It is the only source that can be
+	// re-derived indefinitely: SESSION_TOKEN is a ~60-minute snapshot taken
+	// at run start with nothing writing a refreshed value back, and the
+	// refresh token behind it expires relative to the *human login* that
+	// produced it (auth_time), not to this run — so a workflow launched from
+	// a day-old browser session can begin with both already dead. A
+	// key/secret pair has no such clock.
+	if c.auth.APIKey != "" && c.auth.APISecret != "" {
+		clientID, err := c.keySecretClientID()
+		if err != nil {
+			errs = append(errs, fmt.Errorf("resolving Cognito app client id for key/secret: %w", err))
+		} else {
+			tok, expiresIn, err := mintCognitoAccessToken(c.httpClient, c.auth.CognitoRegion, clientID, c.auth.APIKey, c.auth.APISecret)
+			if err != nil {
+				errs = append(errs, fmt.Errorf("minting Cognito access token: %w", err))
+			} else {
+				c.bearer.token = tok
+				c.bearer.expiry = time.Now().Add(time.Duration(expiresIn) * time.Second)
+				slog.Info("minted access token from API key/secret", "expiresIn", expiresIn)
+				return tok, nil
+			}
+		}
 	}
 
 	// The injected session token, considered once. Expect it to be expired on
@@ -360,8 +400,6 @@ func (c *Client) getBearer() (string, error) {
 		}
 	}
 
-	var errs []error
-
 	if c.auth.RefreshToken != "" {
 		clientID, err := c.cognitoClientID()
 		if err != nil {
@@ -379,27 +417,43 @@ func (c *Client) getBearer() (string, error) {
 		}
 	}
 
-	if c.auth.APIKey != "" && c.auth.APISecret != "" && c.auth.CognitoAppID != "" {
-		tok, expiresIn, err := mintCognitoAccessToken(c.httpClient, c.auth.CognitoRegion, c.auth.CognitoAppID, c.auth.APIKey, c.auth.APISecret)
-		if err != nil {
-			errs = append(errs, fmt.Errorf("minting Cognito access token: %w", err))
-		} else {
-			c.bearer.token = tok
-			c.bearer.expiry = time.Now().Add(time.Duration(expiresIn) * time.Second)
-			return tok, nil
-		}
-	}
-
 	if len(errs) == 0 {
 		return "", fmt.Errorf("no bearer source available: session token expired and neither REFRESH_TOKEN nor PENNSIEVE_API_KEY is set")
 	}
 	return "", errors.Join(errs...)
 }
 
+// keySecretClientID resolves the app client id for a USER_PASSWORD_AUTH
+// mint from an API key/secret.
+//
+// Unlike cognitoClientID this deliberately ignores the session token's
+// client_id claim. That token comes from the *user* pool (a human login),
+// while an API key/secret is a *token* pool user — borrowing the claim
+// would point the mint at the wrong pool and fail as "Incorrect username
+// or password". fetchCognitoConfig returns the token pool's client.
+func (c *Client) keySecretClientID() (string, error) {
+	if c.auth.CognitoAppID != "" {
+		return c.auth.CognitoAppID, nil
+	}
+	region, id, err := fetchCognitoConfig(c.httpClient, c.apiHost)
+	if err != nil {
+		return "", err
+	}
+	c.auth.CognitoAppID = id
+	if region != "" {
+		c.auth.CognitoRegion = region
+	}
+	return id, nil
+}
+
 // cognitoClientID resolves the app client id needed for a Cognito
 // InitiateAuth call, in order: configured value, the client_id claim on the
 // session token we were handed, then the unauthenticated cognito-config
 // endpoint on the legacy API host.
+//
+// The claim-based step is correct for REFRESH_TOKEN_AUTH specifically: a
+// refresh must target whichever pool minted the token, and the token
+// records that in client_id.
 func (c *Client) cognitoClientID() (string, error) {
 	if c.auth.CognitoAppID != "" {
 		return c.auth.CognitoAppID, nil
@@ -442,12 +496,29 @@ func fetchCognitoConfig(httpClient *http.Client, apiHost string) (string, string
 		UserPool struct {
 			AppClientID string `json:"appClientId"`
 		} `json:"userPool"`
+		TokenPool struct {
+			AppClientID string `json:"appClientId"`
+		} `json:"tokenPool"`
 	}
 	if err := json.Unmarshal(body, &parsed); err != nil {
 		return "", "", fmt.Errorf("decoding cognito config: %w", err)
 	}
+
+	// API key/secret pairs are users of the token pool; the user pool holds
+	// human email/password logins. Authenticating a key against the user
+	// pool's client fails as "Incorrect username or password" — that
+	// username genuinely does not exist there — which reads as bad
+	// credentials rather than a misrouted request. Prefer tokenPool and
+	// fall back to userPool for deployments that publish no token pool.
+	//
+	// The fallback keys off the value, not the field's presence: the real
+	// response carries identityPool.appClientId as "", so a presence check
+	// would happily hand Cognito an empty client id.
+	if id := parsed.TokenPool.AppClientID; id != "" {
+		return parsed.Region, id, nil
+	}
 	if parsed.UserPool.AppClientID == "" {
-		return "", "", fmt.Errorf("cognito config has no userPool.appClientId")
+		return "", "", fmt.Errorf("cognito config has no tokenPool.appClientId or userPool.appClientId")
 	}
 	return parsed.Region, parsed.UserPool.AppClientID, nil
 }
