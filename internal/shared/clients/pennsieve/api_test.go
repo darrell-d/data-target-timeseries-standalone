@@ -176,7 +176,11 @@ func TestCanBearer(t *testing.T) {
 		{"session token", AuthConfig{SessionToken: "t"}, true},
 		{"refresh token only", AuthConfig{RefreshToken: "r"}, true},
 		{"full api key set", AuthConfig{APIKey: "k", APISecret: "s", CognitoAppID: "c"}, true},
-		{"partial api key set", AuthConfig{APIKey: "k", APISecret: "s"}, false},
+		// No app id is fine: cognitoClientID discovers it. Requiring it here
+		// gated the key/secret path on the value discovery provides, so a
+		// valid pair fell through to Callback auth and drew an opaque 401.
+		{"api key without app id", AuthConfig{APIKey: "k", APISecret: "s"}, true},
+		{"api key without secret", AuthConfig{APIKey: "k"}, false},
 		{"callback only", AuthConfig{}, false},
 	}
 	for _, tc := range cases {
@@ -190,4 +194,147 @@ func TestCanBearer(t *testing.T) {
 
 func newTestClient(auth AuthConfig) *Client {
 	return NewClient("https://api.test", "https://api2.test", "run-1", "cb-token", auth)
+}
+
+// cognitoConfigServer serves the unauthenticated cognito-config endpoint with
+// the given pool client ids. An empty string omits nothing — it is served as
+// "", which is the shape the real response uses for identityPool.
+func cognitoConfigServer(t *testing.T, userPoolID, tokenPoolID string, includeTokenPool bool) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/authentication/cognito-config" {
+			t.Errorf("unexpected path %q", r.URL.Path)
+		}
+		payload := map[string]any{
+			"region":   "us-east-1",
+			"userPool": map[string]any{"appClientId": userPoolID},
+		}
+		if includeTokenPool {
+			payload["tokenPool"] = map[string]any{"appClientId": tokenPoolID}
+		}
+		_ = json.NewEncoder(w).Encode(payload)
+	}))
+}
+
+func TestFetchCognitoConfigPoolSelection(t *testing.T) {
+	// API key/secret pairs are token-pool users. Sending one to the user
+	// pool's client fails as "Incorrect username or password", because that
+	// username genuinely does not exist there — an error that reads as bad
+	// credentials rather than a misrouted request.
+	cases := []struct {
+		name             string
+		userPool         string
+		tokenPool        string
+		includeTokenPool bool
+		want             string
+		wantErr          bool
+	}{
+		{"prefers token pool", "user-pool-client", "token-pool-client", true, "token-pool-client", false},
+		{"falls back when token pool absent", "user-pool-client", "", false, "user-pool-client", false},
+		{"falls back when token pool empty", "user-pool-client", "", true, "user-pool-client", false},
+		{"errors when neither is set", "", "", true, "", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := cognitoConfigServer(t, tc.userPool, tc.tokenPool, tc.includeTokenPool)
+			defer srv.Close()
+
+			region, id, err := fetchCognitoConfig(srv.Client(), srv.URL)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatal("expected an error when no client id is published")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("fetchCognitoConfig: %v", err)
+			}
+			if id != tc.want {
+				t.Errorf("appClientId = %q, want %q", id, tc.want)
+			}
+			if region != "us-east-1" {
+				t.Errorf("region = %q, want us-east-1", region)
+			}
+		})
+	}
+}
+
+// TestGetBearerPrefersKeySecret pins the precedence change. A key/secret pair
+// is the only credential that survives a multi-hour run, so it must win even
+// when a still-valid session token is present — that token will be dead by
+// the time a later stage needs it, and nothing writes a refreshed one back.
+func TestGetBearerPrefersKeySecret(t *testing.T) {
+	liveSession := testJWT(map[string]any{
+		"exp":       time.Now().Add(time.Hour).Unix(),
+		"client_id": "user-pool-client",
+	})
+	minted := testJWT(map[string]any{"exp": time.Now().Add(time.Hour).Unix()})
+
+	cfg := cognitoConfigServer(t, "user-pool-client", "token-pool-client", true)
+	defer cfg.Close()
+
+	var gotAuthFlow, gotClientID, gotUsername, gotPassword string
+	cognito := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			AuthFlow       string            `json:"AuthFlow"`
+			AuthParameters map[string]string `json:"AuthParameters"`
+			ClientId       string            `json:"ClientId"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Errorf("decoding InitiateAuth body: %v", err)
+		}
+		gotAuthFlow = body.AuthFlow
+		gotClientID = body.ClientId
+		gotUsername = body.AuthParameters["USERNAME"]
+		gotPassword = body.AuthParameters["PASSWORD"]
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"AuthenticationResult": map[string]any{"AccessToken": minted, "ExpiresIn": 3600},
+		})
+	}))
+	defer cognito.Close()
+
+	c := NewClient(cfg.URL, "https://api2.test", "run-1", "cb-token", AuthConfig{
+		SessionToken: liveSession,
+		RefreshToken: "refresh-me",
+		APIKey:       "my-key",
+		APISecret:    "my-secret",
+	})
+	c.httpClient = cognito.Client()
+	cognitoEndpointOverride = cognito.URL + "/"
+	defer func() { cognitoEndpointOverride = "" }()
+
+	got, err := c.getBearer()
+	if err != nil {
+		t.Fatalf("getBearer: %v", err)
+	}
+	if got != minted {
+		t.Error("expected the freshly minted token, not the injected session token")
+	}
+	if gotAuthFlow != "USER_PASSWORD_AUTH" {
+		t.Errorf("AuthFlow = %q, want USER_PASSWORD_AUTH", gotAuthFlow)
+	}
+	if gotUsername != "my-key" || gotPassword != "my-secret" {
+		t.Errorf("credentials = %q/%q, want my-key/my-secret", gotUsername, gotPassword)
+	}
+	// The decisive assertion: the mint must target the token pool, NOT the
+	// client_id carried on the user-pool session token. Deriving it from that
+	// claim is right for a refresh and wrong for a mint.
+	if gotClientID != "token-pool-client" {
+		t.Errorf("ClientId = %q, want token-pool-client", gotClientID)
+	}
+}
+
+// TestGetBearerFallsBackToSessionTokenWithoutKeySecret guards the ordering
+// change against regressing the original processor-mode path.
+func TestGetBearerFallsBackToSessionTokenWithoutKeySecret(t *testing.T) {
+	live := testJWT(map[string]any{"exp": time.Now().Add(time.Hour).Unix()})
+	c := newTestClient(AuthConfig{SessionToken: live})
+
+	got, err := c.getBearer()
+	if err != nil {
+		t.Fatalf("getBearer: %v", err)
+	}
+	if got != live {
+		t.Error("expected the session token when no key/secret is configured")
+	}
 }
