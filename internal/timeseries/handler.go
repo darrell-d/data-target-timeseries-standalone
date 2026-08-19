@@ -128,14 +128,16 @@ func Run(ctx context.Context, cfg *config.Config, client *pennsieve.Client) (str
 	var createdChannelNodeIDs []string
 
 	if err := runIngest(ctx, client, cfg, tc, asset, uploadCreds, channelsHostPackageID, channelFiles, dataFiles, &createdChannelNodeIDs); err != nil {
-		// DEBUG: cleanup disabled so we can inspect post-failure state.
-		// Channels and asset will remain in the DB. Re-enable before
-		// merging / shipping for real.
-		slog.Warn("DEBUG MODE: cleanup disabled — channels and asset preserved for inspection",
+		// Roll back this run's channels and asset. Without this, a
+		// failed run leaves channels behind whose asset is later
+		// deleted, and the next run refuses to adopt them (see the
+		// viewer_asset_id guard in createOrResolveChannels) — one
+		// failure then blocks every subsequent attempt.
+		slog.Warn("ingest failed; cleaning up channels and asset created by this run",
 			"assetId", asset.ID,
 			"createdChannelNodeIDs", createdChannelNodeIDs,
 			"channelsHostPackageId", channelsHostPackageID)
-		// runCleanup(client, cfg.DatasetID, channelsHostPackageID, asset.ID, createdChannelNodeIDs)
+		runCleanup(client, cfg.DatasetID, channelsHostPackageID, asset.ID, createdChannelNodeIDs)
 		return "", err
 	}
 
