@@ -15,7 +15,8 @@
 //  6. Register ranges via timeseries-service.
 //  7. Mark the asset 'ready'.
 //  8. On any failure: delete created channels, then delete the asset
-//     (the cleanup-queue lambda purges S3 behind the asset row).
+//     (packages-service deletes the asset's S3 prefix synchronously as
+//     part of the DELETE, so there is nothing else to clean up).
 package timeseries
 
 import (
@@ -110,7 +111,10 @@ func Run(ctx context.Context, cfg *config.Config, client *pennsieve.Client) (str
 		"executionRunId", cfg.ExecutionRunID,
 	)
 
-	asset, uploadCreds, err := findOrCreateAsset(client, cfg.DatasetID, packageIDs, tc.AssetName, tc.AssetType)
+	asset, uploadCreds, err := findOrCreateAsset(
+		client, cfg.DatasetID, packageIDs, channelsHostPackageID,
+		tc.AssetName, tc.AssetType,
+	)
 	if err != nil {
 		return "", fmt.Errorf("finding or creating viewer asset: %w", err)
 	}
@@ -240,7 +244,31 @@ func runCleanup(client *pennsieve.Client, datasetID, packageID, assetID string, 
 			"assetId", assetID, "err", err)
 		return
 	}
-	slog.Info("queued asset for cleanup", "assetId", assetID)
+	slog.Info("deleted failed asset", "assetId", assetID)
+}
+
+// purgeAssetChannels deletes every channel on the package linked to the
+// given viewer asset. channels.viewer_asset_id has no FK, so deleting
+// the asset alone leaves the channels behind pointing at a row that no
+// longer exists — and the reuse guard in createOrResolveChannels then
+// hard-errors on every subsequent run. Always call this before deleting
+// an asset we intend to rebuild.
+func purgeAssetChannels(client *pennsieve.Client, packageID, assetID string) error {
+	channels, err := client.GetPackageChannels(packageID)
+	if err != nil {
+		return fmt.Errorf("listing channels on package %s: %w", packageID, err)
+	}
+	for _, ch := range channels {
+		if ch.ViewerAssetID != assetID {
+			continue
+		}
+		if err := client.DeleteChannel(packageID, ch.ID); err != nil {
+			return fmt.Errorf("deleting channel %s on package %s: %w", ch.ID, packageID, err)
+		}
+		slog.Info("deleted channel belonging to replaced asset",
+			"channelId", ch.ID, "name", ch.Name, "assetId", assetID)
+	}
+	return nil
 }
 
 // findOrCreateAsset returns the asset to use for this ingest plus its
@@ -250,7 +278,8 @@ func runCleanup(client *pennsieve.Client, datasetID, packageID, assetID string, 
 //     uploadCreds==nil signals the caller to short-circuit; this is an
 //     idempotent re-run and the asset is already done.
 //   - Existing asset in any other state → assumed to be from a failed
-//     prior run. Delete it (triggers S3 cleanup) and create fresh.
+//     prior run. Replace it: delete its channels, delete the asset,
+//     then create fresh. Channels first — see purgeAssetChannels.
 //   - No existing asset → create.
 //
 // Lookup uses workflow.package_ids (not the aggregating target package)
@@ -260,6 +289,7 @@ func findOrCreateAsset(
 	client *pennsieve.Client,
 	datasetID string,
 	packageIDs []string,
+	channelsHostPackageID string,
 	assetName, assetType string,
 ) (*pennsieve.ViewerAsset, *pennsieve.UploadCredentials, error) {
 	match, err := findAssetByWorkflowPackages(client, datasetID, packageIDs, assetName, assetType)
@@ -274,10 +304,14 @@ func findOrCreateAsset(
 	}
 
 	if match != nil {
-		slog.Info("asset found in non-ready status; assuming prior run failed, deleting and recreating",
+		slog.Info("asset found in non-ready status; assuming prior run failed, replacing it",
 			"assetId", match.ID, "status", match.Status, "packageIds", packageIDs)
+		// Channels before the asset — see purgeAssetChannels.
+		if err := purgeAssetChannels(client, channelsHostPackageID, match.ID); err != nil {
+			return nil, nil, fmt.Errorf("purging channels for replaced asset %s: %w", match.ID, err)
+		}
 		if err := client.DeleteAsset(match.ID, datasetID); err != nil {
-			return nil, nil, fmt.Errorf("deleting stale asset %s: %w", match.ID, err)
+			return nil, nil, fmt.Errorf("deleting replaced asset %s: %w", match.ID, err)
 		}
 	}
 
