@@ -54,6 +54,16 @@ Conditionally required:
 
 Optional: `ORGANIZATION_ID` (logging), `PENNSIEVE_COGNITO_REGION` (defaults `us-east-1`), `ASSET_NAME`, `ASSET_TYPE`, `ASSET_PROPERTIES_FILE`.
 
+## Re-running a workflow
+
+By default a re-run is a **no-op** when the asset is already `ready`: the binary finds it by name+type on the workflow's packages and returns early without uploading anything. That's what makes orchestrator retries cheap.
+
+Set `FORCE_REINGEST=true` on the node to rebuild instead. Nothing is overwritten in place — the asset id is part of the S3 prefix, so a rebuild deletes the existing asset's channels, deletes the asset (packages-service deletes its S3 prefix inside the same DELETE request), and ingests fresh under a new prefix with new channel node ids. There is a window where the asset is gone and the new one isn't ready yet, so don't force a re-ingest on something someone is actively viewing.
+
+The new channel node ids are load-bearing. `timeseries.ranges` has an `EXCLUDE USING gist (channel, range)` constraint and lives in a different database from `channels` and `viewer_assets`, so there is no FK and nothing cascades: deleting a channel or an asset leaves its range rows behind. Rebuilding under fresh channel node ids means the re-registered ranges never collide with the old ones. The orphans are dead weight — reads select by channel node id, so nothing queries them again — but they do accumulate, one row per chunk per forced re-ingest.
+
+Channels are deleted before the asset on every replacement, forced or not. `channels.viewer_asset_id` has no FK, so deleting only the asset leaves channels pointing at a dead row, and the reuse guard in `createOrResolveChannels` then hard-errors on every later run (`... is linked to viewer_asset_id=... but the current ingest expects ...`). Runs that die hard enough to skip cleanup entirely can still leave that state behind — `cmd/orphaned-channels` clears it.
+
 ## Known caveat carried over
 
 `runCleanup` in `internal/timeseries/handler.go` is still commented out at the failure-path call site so failed runs leave the asset + channels behind for inspection. Re-enable before treating this as production-ready.

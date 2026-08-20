@@ -21,6 +21,13 @@ func intFromEnv(key string, def int) int {
 	return v
 }
 
+// boolFromEnv reads a boolean from the environment. Anything
+// unparseable (including unset) is false.
+func boolFromEnv(key string) bool {
+	v, err := strconv.ParseBool(os.Getenv(key))
+	return err == nil && v
+}
+
 // Config holds the workflow-runtime fields common to every data target.
 // Target-specific config (asset name, properties file, etc.) lives in
 // the target's own package.
@@ -38,6 +45,12 @@ type Config struct {
 	// with concurrency until the task's NIC saturates. Tunable via
 	// UPLOAD_CONCURRENCY without a redeploy.
 	UploadConcurrency int
+
+	// ForceReingest makes a re-run rebuild an asset that is already
+	// 'ready' — delete its channels and the asset, then ingest fresh —
+	// instead of short-circuiting. Off by default: the no-op re-run is
+	// what makes workflow retries cheap.
+	ForceReingest bool
 
 	// API auth. See pennsieve.AuthConfig for resolution order.
 	SessionToken    string
@@ -65,6 +78,7 @@ func Load() (*Config, error) {
 		CognitoAppID:    os.Getenv("PENNSIEVE_COGNITO_APP_ID"),
 
 		UploadConcurrency: intFromEnv("UPLOAD_CONCURRENCY", defaultUploadConcurrency),
+		ForceReingest:     boolFromEnv("FORCE_REINGEST"),
 	}
 
 	if cfg.InputDir == "" {

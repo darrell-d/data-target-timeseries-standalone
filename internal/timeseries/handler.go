@@ -113,7 +113,7 @@ func Run(ctx context.Context, cfg *config.Config, client *pennsieve.Client) (str
 
 	asset, uploadCreds, err := findOrCreateAsset(
 		client, cfg.DatasetID, packageIDs, channelsHostPackageID,
-		tc.AssetName, tc.AssetType,
+		tc.AssetName, tc.AssetType, cfg.ForceReingest,
 	)
 	if err != nil {
 		return "", fmt.Errorf("finding or creating viewer asset: %w", err)
@@ -276,11 +276,22 @@ func purgeAssetChannels(client *pennsieve.Client, packageID, assetID string) err
 //
 //   - Existing asset with status='ready' → return (asset, nil).
 //     uploadCreds==nil signals the caller to short-circuit; this is an
-//     idempotent re-run and the asset is already done.
+//     idempotent re-run and the asset is already done. FORCE_REINGEST
+//     (force=true) skips this case and rebuilds instead.
 //   - Existing asset in any other state → assumed to be from a failed
-//     prior run. Replace it: delete its channels, delete the asset,
-//     then create fresh. Channels first — see purgeAssetChannels.
+//     prior run. Replace it.
 //   - No existing asset → create.
+//
+// Replacing means: delete the asset's channels, delete the asset, then
+// create a new one. The asset id is part of the S3 prefix, so a rebuild
+// never writes over the old chunks — the old objects go away with the
+// asset (packages-service deletes the prefix inside the DELETE) and the
+// new data lands under a fresh prefix with fresh channel node ids.
+//
+// The fresh node ids matter: timeseries.ranges carries an
+// EXCLUDE USING gist (channel, range) constraint, so re-registering
+// overlapping ranges under a reused channel would be a hard failure.
+// Rebuilding under new channels sidesteps that entirely.
 //
 // Lookup uses workflow.package_ids (not the aggregating target package)
 // because viewer_asset_packages is keyed by the per-package linkage at
@@ -291,21 +302,23 @@ func findOrCreateAsset(
 	packageIDs []string,
 	channelsHostPackageID string,
 	assetName, assetType string,
+	force bool,
 ) (*pennsieve.ViewerAsset, *pennsieve.UploadCredentials, error) {
 	match, err := findAssetByWorkflowPackages(client, datasetID, packageIDs, assetName, assetType)
 	if err != nil {
 		return nil, nil, err
 	}
 
-	if match != nil && match.Status == "ready" {
+	if match != nil && match.Status == "ready" && !force {
 		slog.Info("asset already ready; idempotent re-run, skipping ingest",
 			"assetId", match.ID, "packageIds", packageIDs)
 		return match, nil, nil
 	}
 
 	if match != nil {
-		slog.Info("asset found in non-ready status; assuming prior run failed, replacing it",
-			"assetId", match.ID, "status", match.Status, "packageIds", packageIDs)
+		slog.Info("replacing existing asset",
+			"assetId", match.ID, "status", match.Status,
+			"forced", force, "packageIds", packageIDs)
 		// Channels before the asset — see purgeAssetChannels.
 		if err := purgeAssetChannels(client, channelsHostPackageID, match.ID); err != nil {
 			return nil, nil, fmt.Errorf("purging channels for replaced asset %s: %w", match.ID, err)
