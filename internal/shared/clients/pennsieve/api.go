@@ -278,8 +278,10 @@ func (c *Client) ListAssetsForPackage(datasetID, packageID string) ([]ViewerAsse
 	return result.Assets, nil
 }
 
-// DeleteAsset deletes a viewer asset. Triggers async S3 cleanup via the
-// cleanup-queue lambda; safe to call from failure-path cleanup.
+// DeleteAsset deletes a viewer asset. packages-service deletes the
+// asset's S3 prefix as part of the same request, so this is the whole
+// cleanup for the asset's objects. It does NOT touch the asset's
+// channels or their timeseries.ranges rows — see purgeAssetChannels.
 func (c *Client) DeleteAsset(assetID, datasetID string) error {
 	reqURL := fmt.Sprintf("%s/packages/assets/%s?dataset_id=%s",
 		c.apiHost2,
